@@ -1,0 +1,16 @@
+{
+  "name": "deriv-synthetic-scanner",
+  "version": "1.0.0",
+  "description": "Always-on Deriv synthetic indices scanner — Trend Score + No-Wick Retest strategy, alerts via Telegram.",
+  "main": "scanner.js",
+  "scripts": {
+    "start": "node scanner.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  }
+}
