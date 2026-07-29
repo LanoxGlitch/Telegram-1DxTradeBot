@@ -11,11 +11,16 @@
  *
  *   2. ENTRY ENGINE  — "No-Wick" price-action + retest, gated by the
  *      trend bias (Bullish family -> BUY only, Bearish family -> SELL
- *      only, Mixed -> ignored):
- *        - BUY setup:  a bullish candle with (effectively) no lower wick.
- *                      Its low becomes the level to watch.
- *        - SELL setup: a bearish candle with (effectively) no upper wick.
- *                      Its high becomes the level to watch.
+ *      only, Mixed -> ignored). A candle qualifies only if ALL of:
+ *        - Strong body: body/range >= minBodyRatio (default 0.6) — filters
+ *          out small/indecisive candles before the wick check even runs.
+ *        - Entry-side wick: (body mode, default) the wick on the side
+ *          being traded is <= wickToleranceBodyPercent (default 5%) of
+ *          the body. BUY -> lower wick checked, its low becomes the level
+ *          to watch. SELL -> upper wick checked, its high becomes the level.
+ *        - Opposite-side wick: capped at oppositeWickBodyPercent (default
+ *          50% of body) so shooting-star / hammer shaped candles (clean on
+ *          the entry side but huge on the far side) don't qualify.
  *        A retest of that level within `countdownLength` candles triggers
  *        a signal with a 1:1 stop-loss/take-profit (risk = the pattern
  *        candle's own high-low range). The setup then resolves win/loss
@@ -70,9 +75,25 @@ const CFG = {
   // Entry Engine
   trendTimeframe: TIMEFRAMES[process.env.TREND_TIMEFRAME] ? process.env.TREND_TIMEFRAME : '1h',
   entryTimeframe: TIMEFRAMES[process.env.ENTRY_TIMEFRAME] ? process.env.ENTRY_TIMEFRAME : '15m',
-  wickToleranceMode: process.env.WICK_TOLERANCE_MODE === 'body' ? 'body' : 'range',
+  // 'body' mode (default) measures the entry-side wick against the candle's
+  // own body — this is what actually captures "clean marubozu-style candle"
+  // rather than 'range' mode, where a small wick can hide inside a large
+  // high-low range. Tightened from the old 15% default: at 15%, a wick that
+  // is visibly a wick (e.g. 7-8 pips on a 50-pip body) still passed.
+  wickToleranceMode: process.env.WICK_TOLERANCE_MODE === 'range' ? 'range' : 'body',
   wickTolerancePercent: floatEnv('WICK_TOLERANCE_PERCENT', 3),
-  wickToleranceBodyPercent: floatEnv('WICK_TOLERANCE_BODY_PERCENT', 15),
+  wickToleranceBodyPercent: floatEnv('WICK_TOLERANCE_BODY_PERCENT', 5),
+  // Minimum body/range ratio required before a candle is even considered —
+  // filters out small/indecisive candles that could otherwise pass the wick
+  // check only because everything about the candle (body AND wicks) is tiny.
+  minBodyRatio: floatEnv('MIN_BODY_RATIO', 0.6),
+  // Caps the *far-side* wick too (e.g. the upper wick on a bullish no-lower-
+  // wick candle). Without this, a shooting-star-shaped candle (no lower
+  // wick, huge upper wick) still qualifies as a clean bullish setup, which
+  // isn't what "no-wick" should mean. Expressed as % of body, looser than
+  // the entry-side tolerance since it's a backstop, not the primary check.
+  oppositeWickCheckEnabled: process.env.OPPOSITE_WICK_CHECK === 'false' ? false : true,
+  oppositeWickBodyPercent: floatEnv('OPPOSITE_WICK_BODY_PERCENT', 50),
   countdownLength: intEnv('COUNTDOWN_LENGTH', 10),
 
   scanIntervalMs: intEnv('SCAN_INTERVAL_MS', 2000),
@@ -526,16 +547,42 @@ function priceDigits(price) {
 
 function isNoLowerWickBullish(candle) {
   if (candle.close <= candle.open) return false;
-  return passesWickCheck(candle, Math.abs(candle.low - candle.open));
+  if (!hasStrongBody(candle)) return false;
+  if (!passesWickCheck(candle, Math.abs(candle.low - candle.open))) return false;
+  // Backstop: reject shooting-star-shaped candles (clean bottom, huge top).
+  if (CFG.oppositeWickCheckEnabled && !passesOppositeWickCheck(candle, Math.abs(candle.high - candle.close))) return false;
+  return true;
 }
 function isNoUpperWickBearish(candle) {
   if (candle.close >= candle.open) return false;
-  return passesWickCheck(candle, Math.abs(candle.high - candle.open));
+  if (!hasStrongBody(candle)) return false;
+  if (!passesWickCheck(candle, Math.abs(candle.high - candle.open))) return false;
+  // Backstop: reject hammer-shaped candles (clean top, huge bottom).
+  if (CFG.oppositeWickCheckEnabled && !passesOppositeWickCheck(candle, Math.abs(candle.close - candle.low))) return false;
+  return true;
 }
+
+/** Requires the candle's body to make up a meaningful share of its full
+ * high-low range, so a wick that's technically "small" isn't just small
+ * because the whole candle was tiny/indecisive. */
+function hasStrongBody(candle, minBodyRatio = CFG.minBodyRatio) {
+  const range = candle.high - candle.low;
+  if (range <= 0) return false;
+  const body = Math.abs(candle.close - candle.open);
+  return (body / range) >= minBodyRatio;
+}
+
 function passesWickCheck(candle, wickSize) {
   return CFG.wickToleranceMode === 'body'
     ? wickSize <= wickToleranceBody(candle)
     : wickSize <= wickTolerance(candle);
+}
+/** Looser check on the far-side wick — a backstop against shooting-star /
+ * hammer shapes, not the primary "no-wick" signal. */
+function passesOppositeWickCheck(candle, wickSize) {
+  const body = Math.abs(candle.close - candle.open);
+  const tolerance = Math.max(body * (CFG.oppositeWickBodyPercent / 100), candle.close * 0.00005);
+  return wickSize <= tolerance;
 }
 function wickTolerance(candle) {
   const range = candle.high - candle.low;
